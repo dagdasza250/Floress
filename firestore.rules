@@ -1,10 +1,126 @@
-// allow tylko właścicielowi
+// allow tylko właścicielowi + walidacje pól i explicit denies
 rules_version = '2';
 service cloud.firestore {
   match /databases/{db}/documents {
     function isUser(uid){ return request.auth != null && request.auth.uid == uid; }
-    match /users/{uid}/{col=**}/{doc} {
-      allow read, write: if isUser(uid);
+
+    // Utility validators
+    function isStringMax(x, max) { return x is string && x.size() <= max; }
+    function isNonEmptyStringMax(x, max) { return x is string && x.size() > 0 && x.size() <= max; }
+    function isTimestamp(x) { return x is timestamp; }
+    function isNumber(x) { return x is number; }
+    function hasOnlyFields(d, fields) { return d.keys().hasOnly(fields); }
+    function hasField(d, f) { return d.keys().hasAny([f]); }
+    function optionalStringMax(d, f, max) { return !hasField(d,f) || (d[f] is string && d[f].size() <= max); }
+    function isListMax(l, maxLen) { return l is list && l.size() <= maxLen; }
+
+    // Explicit denies for admin/service collections outside /users
+    match /admin/{document=**} { allow read, write: if false; }
+    match /service/{document=**} { allow read, write: if false; }
+
+    // Users subtree with detailed validation
+    match /users/{uid} {
+      // profiles/{uid}
+      match /profiles/{docUid} {
+        allow read: if isUser(uid);
+        allow create: if isUser(uid)
+          && docUid == uid
+          && hasOnlyFields(request.resource.data, ['displayName','createdAt','preferences'])
+          && isNonEmptyStringMax(request.resource.data.displayName, 100)
+          && isTimestamp(request.resource.data.createdAt)
+          && (!hasField(request.resource.data, 'preferences') || request.resource.data.preferences is map);
+        allow update: if isUser(uid)
+          && docUid == uid
+          && hasOnlyFields(request.resource.data, ['displayName','createdAt','preferences'])
+          && isNonEmptyStringMax(request.resource.data.displayName, 100)
+          && isTimestamp(request.resource.data.createdAt)
+          && request.resource.data.createdAt == resource.data.createdAt
+          && (!hasField(request.resource.data, 'preferences') || request.resource.data.preferences is map);
+        allow delete: if isUser(uid) && docUid == uid;
+      }
+
+      // conversations/{cid}
+      match /conversations/{cid} {
+        allow read: if isUser(uid);
+        function validConversation(data) {
+          return hasOnlyFields(data, ['title','createdAt','updatedAt','moodAtStart','keyConcepts'])
+            && isNonEmptyStringMax(data.title, 200)
+            && isTimestamp(data.createdAt)
+            && isTimestamp(data.updatedAt)
+            && (!hasField(data, 'moodAtStart') || isNumber(data.moodAtStart))
+            && (!hasField(data, 'keyConcepts') || isListMax(data.keyConcepts, 20));
+        }
+        allow create: if isUser(uid) && validConversation(request.resource.data);
+        allow update: if isUser(uid) && validConversation(request.resource.data)
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.updatedAt >= resource.data.updatedAt;
+        allow delete: if isUser(uid);
+
+        // conversations/{cid}/messages/{mid}
+        match /messages/{mid} {
+          allow read: if isUser(uid);
+          function validMessage(data) {
+            return hasOnlyFields(data, ['role','text','ts'])
+              && (['user','assistant'].hasAny([data.role]))
+              && isNonEmptyStringMax(data.text, 4000)
+              && isTimestamp(data.ts);
+          }
+          allow create: if isUser(uid) && validMessage(request.resource.data);
+          allow update: if isUser(uid) && validMessage(request.resource.data)
+            && request.resource.data.ts == resource.data.ts;
+          allow delete: if isUser(uid);
+        }
+      }
+
+      // journalEntries/{jid} (encrypted)
+      match /journalEntries/{jid} {
+        allow read: if isUser(uid);
+        function validJournal(data) {
+          return hasOnlyFields(data, ['ts','title','cipherText','iv','tag'])
+            && isTimestamp(data.ts)
+            && optionalStringMax(data, 'title', 200)
+            && isNonEmptyStringMax(data.cipherText, 20000)
+            && isNonEmptyStringMax(data.iv, 128)
+            && isNonEmptyStringMax(data.tag, 256);
+        }
+        allow create: if isUser(uid) && validJournal(request.resource.data);
+        allow update: if isUser(uid) && validJournal(request.resource.data)
+          && request.resource.data.ts == resource.data.ts;
+        allow delete: if isUser(uid);
+      }
+
+      // moodEntries/{mid}
+      match /moodEntries/{mid} {
+        allow read: if isUser(uid);
+        function validMood(data) {
+          return hasOnlyFields(data, ['ts','mood','tags'])
+            && isTimestamp(data.ts)
+            && isNumber(data.mood) && data.mood >= 0 && data.mood <= 10
+            && (!hasField(data, 'tags') || isListMax(data.tags, 10));
+        }
+        allow create: if isUser(uid) && validMood(request.resource.data);
+        allow update: if isUser(uid) && validMood(request.resource.data)
+          && request.resource.data.ts == resource.data.ts;
+        allow delete: if isUser(uid);
+      }
+
+      // progress/{pid}
+      match /progress/{pid} {
+        allow read: if isUser(uid);
+        function validProgress(data) {
+          return hasOnlyFields(data, ['metric','value','ts'])
+            && isNonEmptyStringMax(data.metric, 64)
+            && isNumber(data.value)
+            && isTimestamp(data.ts);
+        }
+        allow create: if isUser(uid) && validProgress(request.resource.data);
+        allow update: if isUser(uid) && validProgress(request.resource.data)
+          && request.resource.data.ts == resource.data.ts;
+        allow delete: if isUser(uid);
+      }
     }
+
+    // Deny anything else by default
+    match /{path=**} { allow read, write: if false; }
   }
 }
